@@ -1,0 +1,19 @@
+// Dumps the Go RAM card's segment decode: one line per segment, "seg 3M 16M".
+package main
+
+import (
+	"c900/chips/ramcard"
+	"fmt"
+)
+
+func main() {
+	for s := 0; s < 256; s++ {
+		b := func(z ramcard.Size) int {
+			if z.Selects(uint8(s)) {
+				return 1
+			}
+			return 0
+		}
+		fmt.Printf("%02x %d %d\n", s, b(ramcard.Size3M), b(ramcard.Size16M))
+	}
+}
