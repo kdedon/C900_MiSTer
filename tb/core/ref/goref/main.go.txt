@@ -1,0 +1,211 @@
+// How the tb/core references were made (not built by this repo): a program
+// against the Go reference simulator (module c900) and the Z8000 Go model
+// (module z8000), built in a Go workspace:
+//   go.work: use ( <z8000>/sim <c900>/sim ./goref )
+//   go_headless_skip_scc.txt, go_headless_dma.txt:
+//     goref -notr -scc -dlog -maxcyc 19800000      (WR lines; D lines)
+//   go_hd_*.txt: the same with -hd hd.img; go_fd_*.txt: -fd1 fd.img
+//     -maxcyc 14600000 (images from tb/core/mkimg.py; the floppy writable,
+//     as tb_core mounts it)
+//   all re-recorded with /AS rising on T1's fall
+//   go_hr_*: goref -board hr -scc -maxcyc 9200001 -hrvram go_hr_vram.pbm;
+//     go_hr_tx.md5 is the md5 of its transaction lines as gate.sh
+//     normalises them, go_hr_io.txt its I/O lines at 04xxH
+//   go_hr_tx.md5 re-recorded with the Z8000 model's segmented LDA bit 15 fix
+// Its traces (Z-bus transactions, -pfrom/-pto pins, -ffrom 6508 bus,
+// -hfrom 8049 pins, -cfrom 8716 controller bus) have tb_core twins
+// (+trace, +fdctrace, +hdctrace, +cbus, +dmalog): the first divergence is
+// found by comparing them.
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"os"
+
+	"c900/chips/fdc"
+	"c900/chips/wd2010"
+	"c900/machine"
+)
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func main() {
+	maxcyc := flag.Uint64("maxcyc", 20000000, "stop after n Z8001 clocks")
+	from := flag.Uint64("from", 0, "first Z8001 clock to log transactions")
+	board := flag.String("board", "headless", "headless|lr|hr")
+	pfrom := flag.Uint64("pfrom", 0, "per-clock pin log from")
+	pto := flag.Uint64("pto", 0, "per-clock pin log to")
+	ffrom := flag.Uint64("ffrom", 1<<62, "6508 bus log from")
+	fto := flag.Uint64("fto", 0, "6508 bus log to")
+	hfrom := flag.Uint64("hfrom", 1<<62, "8049 log from")
+	hto := flag.Uint64("hto", 0, "8049 log to")
+	hdPath := flag.String("hd", "", "hard disk 0 image")
+	fd1Path := flag.String("fd1", "", "floppy drive 1 image")
+	fd0Path := flag.String("fd0", "", "floppy drive 0 image")
+	dlog := flag.Bool("dlog", false, "log DMA memory cycles")
+	sccw := flag.Bool("scc", false, "log SCC U74 data writes (WR lines)")
+	cfrom := flag.Uint64("cfrom", 1<<62, "8716 controller bus log from")
+	cto := flag.Uint64("cto", 0, "8716 controller bus log to")
+	notr := flag.Bool("notr", false, "no Z-bus transaction log")
+	hrvram := flag.String("hrvram", "", "HR card: write the 1024x800 bitmap at the end as PBM")
+	flag.Parse()
+
+	cfg := machine.Config{BIOSSkipMemTest: true, RTCStartTime: "epoch"}
+	if *board == "lr" {
+		cfg.DisplayBoard = machine.LR
+	} else if *board == "hr" {
+		cfg.DisplayBoard = machine.HR
+	} else {
+		cfg.DisplayBoard = machine.Headless
+	}
+	m, err := machine.New(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if *hdPath != "" {
+		r, err := wd2010.Open(*hdPath, false)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		m.InsertHD(0, r.Image)
+	}
+	for d, p := range []string{*fd0Path, *fd1Path} {
+		if p != "" {
+			img, err := fdc.LoadFromFile(p, true)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			m.InsertDisk(d, img)
+		}
+	}
+	prevPDS := true
+	w := bufio.NewWriterSize(os.Stdout, 1<<20)
+	defer w.Flush()
+	if *hrvram != "" && m.HRDisp != nil {
+		defer func() {
+			f, err := os.Create(*hrvram)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return
+			}
+			b := bufio.NewWriter(f)
+			fmt.Fprintf(b, "P1\n1024 800\n")
+			for row := 0; row < 800; row++ {
+				for col := 0; col < 128; col++ {
+					fmt.Fprintf(b, "%08b", m.HRDisp.RawPixelByte(row, col))
+				}
+				fmt.Fprintln(b)
+			}
+			b.Flush()
+			f.Close()
+		}()
+	}
+	var zc uint64
+	prevCLK := false
+	prevAS, prevDS := true, true
+	var lAddr uint16
+	var lST, lSN uint8
+	var lRW, lBW, lNS bool
+	var data uint16
+	var asCyc uint64
+	var pf, ph, pc string
+	for zc < *maxcyc {
+		m.Tick()
+		in, out := m.Sys.LastCPUIn, m.Sys.LastCPUOut
+		rise := in.CLK && !prevCLK
+		if rise {
+			zc++
+		}
+		prevCLK = in.CLK
+		if *dlog {
+			pd := m.PDMAC.LatestPinOutputs()
+			ds := pd.DS_n || !pd.DS_OE || pd.DMAEN_n
+			if prevPDS && !ds {
+				if m.DMAAddr.Direction() {
+					fmt.Fprintf(w, "D %d %06x R\n", zc, m.DMAAddr.Address()<<1)
+				} else {
+					fmt.Fprintf(w, "D %d %06x W %04x\n", zc, m.DMAAddr.Address()<<1, pd.AD)
+				}
+			}
+			prevPDS = ds
+		}
+		if zc >= *cfrom && zc < *cto {
+			pi, po := m.PDMAC.LastInputs(), m.PDMAC.LatestPinOutputs()
+			bd := pi.BD
+			if po.BD_OE {
+				bd &= po.BD
+			}
+			c := fmt.Sprintf("ss=%d sd=%d bd=%02x ireq=%d est=%d breq=%d", b2i(pi.PCSS), b2i(pi.PCSD), bd,
+				b2i(po.IREQ_n), b2i(po.EST_n), b2i(po.BUSREQ_n))
+			if c != pc {
+				fmt.Fprintf(w, "C %d %s\n", zc, c)
+				pc = c
+			}
+		}
+		if zc >= *hfrom && zc < *hto {
+			st, p2, _, _ := m.HDC.MCUPins()
+			h := fmt.Sprintf("%03x p1=%02x p2=%02x ale=%d rd=%d wr=%d", st.PmemAddr&0x7ff, st.P1Out, p2, b2i(st.ALE), b2i(st.RdN), b2i(st.WrN))
+			if h != ph {
+				fmt.Fprintf(w, "H %d %s\n", zc, h)
+				ph = h
+			}
+		}
+		if zc >= *ffrom && zc < *fto {
+			a, do, rwn, sy, _, _, _, irq, _ := m.FDCBoard.CPUPins()
+			var f string
+			if rwn {
+				f = fmt.Sprintf("%04x R s=%d i=%d", a, b2i(sy), b2i(irq))
+			} else {
+				f = fmt.Sprintf("%04x W %02x i=%d", a, do, b2i(irq))
+			}
+			if f != pf {
+				fmt.Fprintf(w, "F %d %s\n", zc, f)
+				pf = f
+			}
+		}
+		if rise && zc >= *pfrom && zc < *pto {
+			fmt.Fprintf(w, "P %d as=%d ds=%d mreq=%d st=%x rw=%d ad=%04x/%d in=%04x wait=%d vi=%d nvi=%d busreq=%d busack=%d\n",
+				zc, b2i(out.AS_n), b2i(out.DS_n), b2i(out.MREQ_n), out.ST, b2i(out.R_W), out.AD, b2i(out.ADDrive), in.AD,
+				b2i(in.WAIT_n), b2i(in.VI_n), b2i(in.NVI_n), b2i(in.BUSREQ_n), b2i(out.BUSACK_n))
+			fa, _, _, _, _, _, _, _, _ := m.FDCBoard.CPUPins()
+			fmt.Fprintf(w, "Q %d ph2=%d fa=%04x rstn=%d\n", zc, b2i(m.FDC.LatestPinOutputs().PH2), fa, b2i(in.RESET_n))
+		}
+		if !prevAS && out.AS_n {
+			asCyc = zc
+		}
+		if !out.DS_n {
+			if out.R_W {
+				data = in.AD
+			} else {
+				data = out.AD
+			}
+		}
+		if *sccw && !prevDS && out.DS_n && lST == 2 && !lRW && (lAddr == 0x0111 || lAddr == 0x0131) {
+			fmt.Fprintf(w, "WR %d %04x %02x\n", asCyc-1, lAddr, data&0xFF)
+		}
+		if !prevDS && out.DS_n && asCyc >= *from && !*notr {
+			rw, bw := "W", "W"
+			if lRW {
+				rw = "R"
+			}
+			if lBW {
+				bw = "B"
+			}
+			fmt.Fprintf(w, "%d st=%x %02x:%04x %s %s n=%d d=%04x\n", asCyc, lST, lSN&0x7f, lAddr, rw, bw, b2i(lNS), data)
+		}
+		if prevAS && !out.AS_n {
+			lAddr, lST, lSN, lRW, lBW, lNS = out.AD, out.ST, out.SN, out.R_W, out.B_W, out.N_S
+		}
+		prevAS, prevDS = out.AS_n, out.DS_n
+	}
+}

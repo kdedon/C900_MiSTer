@@ -1,0 +1,95 @@
+// How ref/go_headless_key.txt was made (not built by this repo): a
+// program against the Go reference simulator (module c900) and the Z8000 Go
+// model (module z8000), built in a Go workspace:
+//   go.work: use ( <z8000>/sim <c900>/sim ./kbdref )
+//   ./kbdref -maxcyc 5600000 -press 5300000 -row 5 -col 5 -hold 100000
+// (2 MHz keyboard crystal, Phase 2 at 1 MHz, with the 311075 cable
+// backpressure; the key goes in early enough to reach the BIOS power-on
+// keystroke poll at about 5.52M)
+// Its IORD lines print the /AS-rise Z8001 clock; the reference file
+// subtracts 1, as gate.sh does to tb_core's IORD lines (re-recorded with
+// /AS rising on T1's fall).
+// Go reference for the C900_MiSTer keyboard gate: the C900 simulator with the
+// LR card and bios.skip_memtest, a key pressed in the matrix at a given
+// Z8001 clock and released when the keyboard has sent its make code.  Logs
+// every CPU I/O read of CIO U70 port A/C data (0x001B, 0x001F) with its
+// Z8001 clock, and the 6500/1 cable bytes.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+
+	"c900/machine"
+)
+
+func main() {
+	maxcyc := flag.Uint64("maxcyc", 14000000, "stop after n Z8001 clocks")
+	pressAt := flag.Uint64("press", 12000000, "Z8001 clock to press the key")
+	row := flag.Int("row", 0, "matrix row (firmware column)")
+	col := flag.Int("col", 0, "matrix col (PD bit)")
+	holdCyc := flag.Uint64("hold", 300000, "Z8001 clocks to hold the key")
+	flag.Parse()
+
+	m, err := machine.New(machine.Config{BIOSSkipMemTest: true})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	var zc uint64
+	prevCLK := false
+	prevAS, prevDS := true, true
+	var lAddr uint16
+	var lST uint8
+	var lRW bool
+	var data uint16
+	var asCyc uint64
+	pressed, released := false, false
+	n11 := 0x100
+	for zc < *maxcyc {
+		m.Tick()
+		in, out := m.Sys.LastCPUIn, m.Sys.LastCPUOut
+		if in.CLK && !prevCLK {
+			zc++
+		}
+		prevCLK = in.CLK
+		if prevAS && !out.AS_n {
+			lAddr, lST, lRW = out.AD, out.ST, out.R_W
+			if out.ST == 0xD && zc%500000 < 4 {
+				fmt.Printf("IF %d %02x:%04x\n", zc, out.SN, out.AD)
+			}
+			if out.ST == 2 && zc > 5500000 && zc < 5520200 {
+				fmt.Printf("IO %d %04x rw=%v\n", zc, out.AD, out.R_W)
+			}
+		}
+		if !prevAS && out.AS_n {
+			asCyc = zc
+		}
+		if !out.DS_n {
+			data = in.AD
+		}
+		if !prevDS && out.DS_n && lST == 2 && lRW && (lAddr == 0x001B || lAddr == 0x001F || (lAddr == 0x0011 && uint16(n11) != data&0xFF)) {
+			if lAddr == 0x0011 {
+				n11 = int(data & 0xFF)
+			}
+			fmt.Printf("IORD %d %04x\n", asCyc, lAddr)
+		}
+		if !prevDS && out.DS_n && lST == 2 && !lRW && lAddr == 0x0111 && zc < 20000 {
+			fmt.Printf("SCCWR %d\n", asCyc)
+		}
+		prevAS, prevDS = out.AS_n, out.DS_n
+		if !pressed && zc >= *pressAt {
+			m.PressKey(*row, *col)
+			pressed = true
+			fmt.Printf("PRESS %d %d %d\n", zc, *row, *col)
+		}
+		if pressed && !released && zc >= *pressAt+*holdCyc {
+			m.ReleaseKey(*row, *col)
+			released = true
+			fmt.Printf("RELEASE %d\n", zc)
+		}
+	}
+	b, _ := m.KeyboardSnifferStats()
+	fmt.Printf("END %d cable_bytes=%d\n", zc, b)
+}
