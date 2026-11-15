@@ -1,0 +1,1200 @@
+// Records the Go Am7990 LANCE and its board (c900/chips/am7990,
+// c900/chips/lanboard) into replay vectors for tb_lance.  Run with
+// tb/lance/gen/mkvec.sh; it writes tb/lance/vec/*.vec.
+//
+// A scenario is a host script (register cycles, interrupt waits, frames
+// offered on the cable, host memory pokes) plus what the Go model did:
+// the ordered bus events (tenure start/end, word and byte cycles, the
+// interrupt pin), the frames it transmitted, and memory at the end.
+// The cable side is the board's frame-buffered loopback: every frame
+// sent comes back through the receive address filter.
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"hash/crc32"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"c900/chips/am7990"
+	"c900/chips/lanboard"
+
+	"z8000/system"
+	"z8000/zbus"
+)
+
+// ---- recording bus ----------------------------------------------------------
+
+type recBus struct {
+	mem   map[uint32]byte
+	held  bool
+	ev    *[]string
+	touch map[uint32]bool
+}
+
+func (b *recBus) RequestBus(int) { b.held = true; *b.ev = append(*b.ev, "Q") }
+func (b *recBus) ReleaseBus(int) { b.held = false; *b.ev = append(*b.ev, "L") }
+func (b *recBus) Granted(int) bool {
+	return b.held
+}
+func (b *recBus) rd(a uint32) byte {
+	if v, ok := b.mem[a&0xFFFFFF]; ok {
+		return v
+	}
+	return 0xFF
+}
+func (b *recBus) ReadWord(a uint32) uint16 {
+	w := uint16(b.rd(a))<<8 | uint16(b.rd(a+1))
+	*b.ev = append(*b.ev, fmt.Sprintf("R %06X %04X", a&0xFFFFFF, w))
+	return w
+}
+func (b *recBus) ReadByte(a uint32) uint8 {
+	v := b.rd(a)
+	*b.ev = append(*b.ev, fmt.Sprintf("C %06X %02X", a&0xFFFFFF, v))
+	return v
+}
+func (b *recBus) WriteWord(a uint32, d uint16) {
+	b.put(a, byte(d>>8))
+	b.put(a+1, byte(d))
+	*b.ev = append(*b.ev, fmt.Sprintf("W %06X %04X", a&0xFFFFFF, d))
+}
+func (b *recBus) WriteByte(a uint32, d uint8) {
+	b.put(a, d)
+	*b.ev = append(*b.ev, fmt.Sprintf("B %06X %02X", a&0xFFFFFF, d))
+}
+func (b *recBus) put(a uint32, d byte) {
+	b.mem[a&0xFFFFFF] = d
+	b.touch[a&0xFFFFFF] = true
+}
+
+// ---- scenario recorder ----------------------------------------------------------
+
+type scen struct {
+	name    string
+	intl    bool
+	chip    *am7990.Chip
+	loop    *lanboard.Loopback
+	bus     *recBus
+	ev      []string
+	script  []string
+	init    []string
+	txs     []string
+	emiR    am7990.MACEmiR
+	recR    am7990.MACRecR
+	lastINT bool
+	ticks   int
+	quiet   int // ticks since the last event
+	csr3    uint16
+	noev    int    // directed: 1 no event check, 2 no frame check either
+	zw      []uint32 // directed: the memory words checked at the end
+}
+
+func newScen(name string) *scen {
+	s := &scen{name: name, csr3: 0x0007}
+	s.bus = &recBus{mem: map[uint32]byte{}, ev: &s.ev, touch: map[uint32]bool{}}
+	s.chip = am7990.New(s.bus, lanboard.LANMasterID)
+	s.loop = lanboard.NewLoopback()
+	s.loop.OnTransmit = func(f []byte) { s.txs = append(s.txs, hexs(f)) }
+	return s
+}
+
+func hexs(b []byte) string {
+	var sb strings.Builder
+	for _, x := range b {
+		fmt.Fprintf(&sb, "%02X", x)
+	}
+	return sb.String()
+}
+
+// mem sets initial memory (before the script runs).
+func (s *scen) mem(a uint32, b ...byte) {
+	for i, x := range b {
+		s.bus.mem[a+uint32(i)] = x
+	}
+}
+func (s *scen) memw(a uint32, w ...uint16) {
+	for i, x := range w {
+		s.mem(a+uint32(2*i), byte(x>>8), byte(x))
+	}
+}
+
+func (s *scen) chkINT() {
+	if v := s.chip.INT(); v != s.lastINT {
+		s.lastINT = v
+		b := 0
+		if v {
+			b = 1
+		}
+		s.ev = append(s.ev, fmt.Sprintf("I %d", b))
+	}
+}
+
+func (s *scen) tick() {
+	n := len(s.ev)
+	emiW, recW := s.chip.Tick(s.emiR, s.recR)
+	s.emiR, s.recR = s.loop.Tick(emiW, recW)
+	s.ticks++
+	s.chkINT()
+	if len(s.ev) != n {
+		s.quiet = 0
+	} else {
+		s.quiet++
+	}
+}
+
+func (s *scen) w(adr uint8, d uint16) {
+	s.chip.WriteReg(adr, d)
+	s.script = append(s.script, fmt.Sprintf("S W %d %04X", adr, d))
+	s.chkINT()
+}
+func (s *scen) csr(n uint8, d uint16) { s.w(am7990.RegRAP, uint16(n)); s.w(am7990.RegRDP, d) }
+
+func (s *scen) r(adr uint8) uint16 {
+	v := s.chip.ReadReg(adr)
+	s.script = append(s.script, fmt.Sprintf("S R %d %04X", adr, v))
+	return v
+}
+
+// waitInt runs until the INTR pin is asserted.
+func (s *scen) waitInt() {
+	for i := 0; !s.chip.INT(); i++ {
+		if i > 200000 {
+			panic(s.name + ": no interrupt")
+		}
+		s.tick()
+	}
+	s.script = append(s.script, "S I")
+}
+
+// waitTx waits for TINT, then lets the chip's ring poll that follows a
+// frame finish before the host answers.
+func (s *scen) waitTx() {
+	s.waitInt()
+	s.run(40)
+}
+
+// iack: an interrupt acknowledge cycle with IEI high returns the strap.
+func (s *scen) iack() {
+	s.script = append(s.script, fmt.Sprintf("S V %02X", lanboard.DefaultVector))
+}
+
+func (s *scen) run(n int) {
+	for i := 0; i < n; i++ {
+		s.tick()
+	}
+	s.script = append(s.script, fmt.Sprintf("S T %d", n))
+}
+
+// poke: the host writes a memory word.
+func (s *scen) poke(a uint32, d uint16) {
+	s.bus.mem[a] = byte(d >> 8)
+	s.bus.mem[a+1] = byte(d)
+	s.bus.touch[a] = true
+	s.bus.touch[a+1] = true
+	s.script = append(s.script, fmt.Sprintf("S P %06X %04X", a, d))
+}
+
+// inject offers a frame from another station; the cable carries the
+// frame with its FCS (the standard CRC-32, low byte first).
+func (s *scen) inject(f []byte) {
+	s.loop.InjectFrame(f)
+	var fcs [4]byte
+	binary.LittleEndian.PutUint32(fcs[:], crc32.ChecksumIEEE(f))
+	s.script = append(s.script, "S F "+hexs(append(append([]byte{}, f...), fcs[:]...)))
+}
+
+// end runs until 4000 ticks pass with no bus or interrupt event.
+func (s *scen) end() {
+	for s.quiet = 0; s.quiet < 4000; {
+		s.tick()
+	}
+	s.script = append(s.script, "S E")
+	if s.ticks > 16000 && !strings.HasPrefix(s.name, "poll") {
+		panic(s.name + ": long enough for a poll")
+	}
+}
+
+func (s *scen) write(dir string) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s: recorded from the Go Am7990 + lanboard loopback\n", s.name)
+	in := 0
+	if s.intl {
+		in = 1
+	}
+	fmt.Fprintf(&b, "O %d\n", in)
+	if s.noev > 0 {
+		fmt.Fprintf(&b, "N %d\n", s.noev)
+	}
+	for _, l := range s.init {
+		b.WriteString(l + "\n")
+	}
+	for _, l := range s.script {
+		b.WriteString(l + "\n")
+	}
+	if s.noev > 0 {
+		for _, f := range s.txs {
+			b.WriteString("Y " + f + "\n")
+		}
+		for _, a := range s.zw {
+			fmt.Fprintf(&b, "Z %06X %02X\nZ %06X %02X\n", a, s.bus.mem[a], a+1, s.bus.mem[a+1])
+		}
+		if err := os.WriteFile(filepath.Join(dir, s.name+".vec"), []byte(b.String()), 0o644); err != nil {
+			panic(err)
+		}
+		return
+	}
+	for _, l := range s.ev {
+		b.WriteString("X " + l + "\n")
+	}
+	for _, f := range s.txs {
+		b.WriteString("Y " + f + "\n")
+	}
+	// final memory: every address set up or written
+	keys := []uint32{}
+	for a := range s.bus.mem {
+		keys = append(keys, a)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	for _, a := range keys {
+		fmt.Fprintf(&b, "Z %06X %02X\n", a, s.bus.mem[a])
+	}
+	if err := os.WriteFile(filepath.Join(dir, s.name+".vec"), []byte(b.String()), 0o644); err != nil {
+		panic(err)
+	}
+}
+
+// snapshot records the initial memory as M lines (call before the script).
+func (s *scen) snapshot() {
+	keys := []uint32{}
+	for a := range s.bus.mem {
+		keys = append(keys, a)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	for _, a := range keys {
+		s.init = append(s.init, fmt.Sprintf("M %06X %02X", a, s.bus.mem[a]))
+	}
+}
+
+// ---- common layout ----------------------------------------------------------
+
+const (
+	iadr  = 0x2A1000
+	rdra  = 0x2A1100
+	tdra  = 0x2A1200
+	rxbuf = 0x2A2000 // + i*0x100
+	txbuf = 0x2A3000 // + i*0x100
+)
+
+var mac = [6]byte{0x02, 0x60, 0x8C, 0x0C, 0x09, 0x00}
+
+type rxd struct {
+	own  bool
+	bcnt int
+}
+
+type txd struct {
+	own, stp, enp bool
+	data          []byte
+}
+
+func neg12(n int) uint16 { return uint16(-n) & 0x0FFF | 0xF000 }
+
+func (s *scen) layout(mode uint16, ladrf uint64, rlen, tlen uint8, rx []rxd, tx []txd) {
+	ib := []uint16{mode,
+		uint16(mac[1])<<8 | uint16(mac[0]), uint16(mac[3])<<8 | uint16(mac[2]), uint16(mac[5])<<8 | uint16(mac[4]),
+		uint16(ladrf), uint16(ladrf >> 16), uint16(ladrf >> 32), uint16(ladrf >> 48),
+		uint16(rdra & 0xFFFF), uint16(rlen)<<13 | uint16(rdra>>16),
+		uint16(tdra & 0xFFFF), uint16(tlen)<<13 | uint16(tdra>>16)}
+	s.memw(iadr, ib...)
+	for i, d := range rx {
+		a := uint32(rxbuf + i*0x100)
+		st := uint16(a >> 16)
+		if d.own {
+			st |= am7990.RMD1OWN
+		}
+		s.memw(uint32(rdra+8*i), uint16(a), st, neg12(d.bcnt), 0x0EEE)
+		for j := 0; j < d.bcnt+2; j++ {
+			s.mem(a+uint32(j), 0xEE)
+		}
+	}
+	for i, d := range tx {
+		a := uint32(txbuf + i*0x100)
+		st := uint16(a >> 16)
+		if d.own {
+			st |= am7990.TMD1OWN
+		}
+		if d.stp {
+			st |= am7990.TMD1STP
+		}
+		if d.enp {
+			st |= am7990.TMD1ENP
+		}
+		s.memw(uint32(tdra+8*i), uint16(a), st, neg12(len(d.data)), 0x0DDD)
+		s.mem(a, d.data...)
+	}
+}
+
+// start programs CSR1-3 and sets INIT (with STRT when strt).
+func (s *scen) start(strt bool) {
+	s.csr(1, uint16(iadr&0xFFFF))
+	s.csr(2, uint16(iadr>>16))
+	s.csr(3, s.csr3) // 7: BSWP, ACON, BCON, the Z8001 setting
+	s.w(am7990.RegRAP, 0)
+	v := uint16(am7990.CSR0INIT | am7990.CSR0INEA)
+	if strt {
+		v |= am7990.CSR0STRT
+	}
+	s.w(am7990.RegRDP, v)
+}
+
+// frame builds dst|src|type|payload.
+func frame(dst [6]byte, n int, seed byte) []byte {
+	f := append([]byte{}, dst[:]...)
+	f = append(f, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x08, 0x00)
+	for i := 0; len(f) < n; i++ {
+		f = append(f, seed+byte(i*7))
+	}
+	return f
+}
+
+var bcast = [6]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+
+// hashIndex: the LADRF bit of a group address (TM App. B), for picking
+// test multicast addresses (the filter decision is the model's).
+func hashIndex(dst []byte) uint32 { return ^crc32.ChecksumIEEE(dst) >> 26 }
+
+const ack = am7990.CSR0INEA | am7990.CSR0IDON | am7990.CSR0TINT | am7990.CSR0RINT | am7990.CSR0MISS
+
+// ---- scenarios ----------------------------------------------------------
+
+func scRegs() *scen {
+	s := newScen("regs")
+	s.layout(am7990.ModeDRX|am7990.ModeDTX, 0, 0, 0, nil, nil)
+	s.snapshot()
+	s.r(am7990.RegRDP) // CSR0 after reset
+	s.r(am7990.RegRAP)
+	s.w(am7990.RegRAP, 0xFFF1) // only RAP[1:0]
+	s.r(am7990.RegRAP)
+	s.w(am7990.RegRDP, 0x5A35) // CSR1, bit 0 forced 0
+	s.r(am7990.RegRDP)
+	s.csr(2, 0xC32A)
+	s.r(am7990.RegRDP)
+	s.csr(3, 0xFFFF)
+	s.r(am7990.RegRDP)
+	s.csr(3, 0x0004)
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRAP, 0)
+	s.w(am7990.RegRDP, am7990.CSR0INEA) // INEA while stopped
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, am7990.CSR0STOP|am7990.CSR0INEA|am7990.CSR0INIT|am7990.CSR0STRT)
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, am7990.CSR0TDMD) // TDMD while stopped
+	s.r(am7990.RegRDP)
+	s.start(false)
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.csr(1, 0x7770) // ignored while running
+	s.r(am7990.RegRDP)
+	s.csr(3, 0x0000)
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRAP, 0)
+	s.w(am7990.RegRDP, am7990.CSR0IDON) // ack, INEA off
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, am7990.CSR0STRT|am7990.CSR0TDMD)
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, am7990.CSR0STOP)
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRAP, 3)
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRAP, 1)
+	s.r(am7990.RegRDP)
+	s.end()
+	return s
+}
+
+func scInit() *scen {
+	s := newScen("init")
+	s.layout(am7990.ModeDTX, 0x0123456789ABCDEF, 3, 2, nil, nil)
+	s.snapshot()
+	s.start(false)
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0IDON|am7990.CSR0STRT)
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, am7990.CSR0STOP)
+	s.r(am7990.RegRDP)
+	// INIT and STRT together: start engages at IDON
+	s.start(true)
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.r(am7990.RegRDP)
+	s.end()
+	return s
+}
+
+func scLoop(name string, mode uint16, n int, intl bool) *scen {
+	s := newScen(name)
+	dst := mac
+	if name == "bswp0" {
+		s.csr3 = 0x0003 // the wire sees each word's bytes crossed
+		dst = bcast
+	}
+	s.intl = intl
+	s.layout(mode, 0, 1, 1,
+		[]rxd{{true, 128}, {true, 128}},
+		[]txd{{true, true, true, frame(dst, n, 0x31)}, {false, true, true, nil}})
+	s.snapshot()
+	s.start(true)
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack|am7990.CSR0TDMD)
+	if intl {
+		// no cable: the frame is received as it leaves, so the host
+		// answers TINT and RINT together
+		s.waitInt()
+		s.run(1500)
+		s.r(am7990.RegRDP)
+		s.iack()
+		s.w(am7990.RegRDP, ack)
+		s.r(am7990.RegRDP)
+		s.end()
+		return s
+	}
+	s.waitTx()
+	s.r(am7990.RegRDP)
+	s.iack()
+	s.w(am7990.RegRDP, ack)
+	s.waitInt() // RINT
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.r(am7990.RegRDP)
+	s.end()
+	return s
+}
+
+func scRing() *scen {
+	s := newScen("ring")
+	s.layout(0, 0, 1, 1,
+		[]rxd{{true, 160}, {true, 160}},
+		[]txd{{true, true, true, frame(mac, 64, 0x10)}, {false, true, true, frame(mac, 71, 0x50)}})
+	s.snapshot()
+	s.start(true)
+	s.waitInt()
+	s.w(am7990.RegRDP, ack|am7990.CSR0TDMD)
+	// TINT, RINT for two frames; the second is handed to the chip only
+	// after the first came back, so transmit and receive never overlap
+	for k := 0; k < 4; k++ {
+		if k%2 == 0 {
+			s.waitTx()
+		} else {
+			s.waitInt()
+		}
+		s.r(am7990.RegRDP)
+		if k == 1 {
+			s.poke(tdra+10, am7990.TMD1OWN|am7990.TMD1STP|am7990.TMD1ENP|uint16(txbuf>>16))
+			s.w(am7990.RegRDP, ack|am7990.CSR0TDMD)
+		} else {
+			s.w(am7990.RegRDP, ack)
+		}
+	}
+	// second pass round both rings: a chained frame, 100 + 33 bytes (a
+	// first buffer of 100 or more, TM p.1-27)
+	f := frame(bcast, 133, 0x70)
+	for i := 0; i < 100; i += 2 {
+		s.poke(uint32(txbuf+i), uint16(f[i])<<8|uint16(f[i+1]))
+	}
+	s.poke(uint32(txbuf+0x100+32), uint16(f[132])<<8|0x99)
+	for i := 0; i < 32; i += 2 {
+		s.poke(uint32(txbuf+0x100+i), uint16(f[100+i])<<8|uint16(f[101+i]))
+	}
+	s.poke(tdra+4, neg12(100))
+	s.poke(tdra+12, neg12(33))
+	s.poke(tdra+2, am7990.TMD1OWN|am7990.TMD1STP|uint16(txbuf>>16))
+	s.poke(tdra+10, am7990.TMD1OWN|am7990.TMD1ENP|uint16(txbuf>>16))
+	s.poke(rdra+2, am7990.RMD1OWN|uint16(rxbuf>>16))
+	s.poke(rdra+6, 0x0000)
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	for k := 0; k < 2; k++ {
+		if k == 0 {
+			s.waitTx()
+		} else {
+			s.waitInt()
+		}
+		s.r(am7990.RegRDP)
+		s.w(am7990.RegRDP, ack)
+	}
+	s.end()
+	return s
+}
+
+func scMiss() *scen {
+	s := newScen("miss")
+	// no transmitter: its 1.6 ms poll would land at a different place
+	s.layout(am7990.ModeDTX, 0, 1, 0, []rxd{{false, 128}, {true, 30}}, nil)
+	s.snapshot()
+	s.start(true)
+	s.waitInt()
+	s.w(am7990.RegRDP, ack)
+	s.inject(frame(mac, 64, 0x20)) // descriptor 0 host-owned: MISS
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.r(am7990.RegRDP)
+	s.poke(rdra+2, am7990.RMD1OWN|uint16(rxbuf>>16))
+	s.inject(frame(mac, 64, 0x40)) // fits descriptor 0
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.inject(frame(mac, 64, 0x60)) // descriptor 1: 30-byte buffer, BUFF
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.end()
+	return s
+}
+
+func scFilter() *scen {
+	s := newScen("filter")
+	// a multicast address whose hash bit is set, one whose bit is clear
+	var mcHit, mcMiss [6]byte
+	var ladrf uint64
+	for i := 0; i < 256; i++ {
+		a := [6]byte{0x01, 0x00, 0x5E, 0x00, 0x00, byte(i)}
+		idx := hashIndex(a[:])
+		if i == 0 {
+			mcHit = a
+			ladrf = 1 << idx
+		} else if ladrf>>idx&1 == 0 {
+			mcMiss = a
+			break
+		}
+	}
+	other := [6]byte{0x02, 0x60, 0x8C, 0x0C, 0x09, 0x01}
+	s.layout(am7990.ModeDTX, ladrf, 2, 0, []rxd{{true, 128}, {true, 128}, {true, 128}, {true, 128}}, nil)
+	s.snapshot()
+	s.start(true)
+	s.waitInt()
+	s.w(am7990.RegRDP, ack)
+	s.inject(frame(other, 64, 0x01))  // dropped
+	s.inject(frame(mac, 64, 0x02))    // ours
+	s.inject(frame(mcMiss, 64, 0x03)) // dropped
+	s.inject(frame(bcast, 64, 0x04))  // broadcast
+	s.inject(frame(mcHit, 65, 0x05))  // hashed in
+	for k := 0; k < 3; k++ {
+		s.waitInt()
+		s.r(am7990.RegRDP)
+		s.w(am7990.RegRDP, ack)
+	}
+	s.run(3000) // the two dropped frames leave no trace
+	// promiscuous: the other station's frame is taken
+	s.w(am7990.RegRDP, am7990.CSR0STOP)
+	s.poke(iadr, am7990.ModePROM|am7990.ModeDTX)
+	s.start(true)
+	s.waitInt()
+	s.w(am7990.RegRDP, ack)
+	s.inject(frame(other, 64, 0x06))
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.end()
+	return s
+}
+
+func scPoll() *scen {
+	s := newScen("poll")
+	s.layout(0, 0, 0, 0, []rxd{{true, 128}}, []txd{{true, true, true, frame(mac, 64, 0x77)}})
+	s.snapshot()
+	s.start(true)
+	s.waitInt()
+	s.w(am7990.RegRDP, ack) // no TDMD: the poll timer finds the frame
+	s.waitTx()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.waitInt() // RINT
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.end()
+	return s
+}
+
+// scOdd: transmit and receive buffers on odd addresses (TM p.1-16).
+func scOdd() *scen {
+	s := newScen("odd")
+	f := frame(mac, 66, 0x41)
+	s.layout(0, 0, 1, 1, []rxd{{true, 128}, {true, 128}},
+		[]txd{{true, true, true, f}, {false, true, true, nil}})
+	s.memw(tdra, uint16((txbuf+1)&0xFFFF))
+	s.mem(txbuf, 0xCC)
+	s.mem(txbuf+1, f...)
+	s.memw(rdra, uint16((rxbuf+1)&0xFFFF))
+	s.snapshot()
+	s.start(true)
+	s.waitInt()
+	s.w(am7990.RegRDP, ack|am7990.CSR0TDMD)
+	s.waitTx()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.end()
+	return s
+}
+
+// scSkip: an owned descriptor without STP at a frame start is skipped
+// (TM p.1-27).
+func scSkip() *scen {
+	s := newScen("skip")
+	s.layout(0, 0, 1, 1, []rxd{{true, 128}, {true, 128}},
+		[]txd{{true, false, true, frame(mac, 64, 0x13)}, {true, true, true, frame(mac, 64, 0x57)}})
+	s.snapshot()
+	s.start(true)
+	s.waitInt()
+	s.w(am7990.RegRDP, ack|am7990.CSR0TDMD)
+	s.waitTx()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.waitInt()
+	s.r(am7990.RegRDP)
+	s.w(am7990.RegRDP, ack)
+	s.end()
+	return s
+}
+
+// ---- directed: behaviour the frame-buffered Go loopback cannot show ----------
+// The script and memory come from the layout helpers; the expected
+// register reads and memory words are the manual's, written here.
+
+func newDir(name string, noev int) *scen {
+	s := newScen(name)
+	s.noev = noev
+	return s
+}
+
+// expect: a register read and the value it must give.
+func (s *scen) expect(adr uint8, v uint16) {
+	s.script = append(s.script, fmt.Sprintf("S R %d %04X", adr, v))
+}
+
+// si: wait for /INTR (the Go chip is not run).
+func (s *scen) si() { s.script = append(s.script, "S I") }
+
+// op: a raw script line.
+func (s *scen) op(f string, a ...any) { s.script = append(s.script, "S "+fmt.Sprintf(f, a...)) }
+
+// zword: memory word a must hold w at the end.
+func (s *scen) zword(a uint32, w uint16) {
+	s.bus.mem[a], s.bus.mem[a+1] = byte(w>>8), byte(w)
+	s.zw = append(s.zw, a)
+}
+
+// cable: a frame with its FCS, as script hex.
+func cable(f []byte) string {
+	var fcs [4]byte
+	binary.LittleEndian.PutUint32(fcs[:], crc32.ChecksumIEEE(f))
+	return hexs(append(append([]byte{}, f...), fcs[:]...))
+}
+
+func (s *scen) dstart() {
+	s.start(true)
+	s.si()
+	s.w(am7990.RegRDP, ack)
+}
+
+const (
+	csr0Run = am7990.CSR0INEA | am7990.CSR0RXON | am7990.CSR0TXON | am7990.CSR0STRT
+	csr0Int = am7990.CSR0INTR | am7990.CSR0INEA | am7990.CSR0STRT
+	hadrRx  = uint16(rxbuf >> 16)
+	hadrTx  = uint16(txbuf >> 16)
+)
+
+// d_uflo: a bus grant too slow for the wire.  The frame is cut without
+// FCS; TMD3 = UFLO, TMD1 = ERR (OWN clear), TINT, TXON off
+// (TM p.1-21, p.1-28).  The cut frame comes back as a runt and is
+// discarded (TM p.1-19): the receive descriptor stays the chip's.
+func dUflo() *scen {
+	s := newDir("d_uflo", 2)
+	s.layout(0, 0, 0, 0, []rxd{{true, 256}}, []txd{{true, true, true, frame(mac, 200, 0x21)}})
+	s.snapshot()
+	s.dstart()
+	s.op("G 1500")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 3000")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0TINT|am7990.CSR0RXON)
+	s.zword(tdra+2, am7990.TMD1ERR|am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(tdra+6, am7990.TMD3UFLO)
+	s.zword(rdra+2, am7990.RMD1OWN|hadrRx)
+	s.op("D")
+	s.op("E")
+	return s
+}
+
+// d_oflo: a 200-byte frame against a slow bus grant.  The silo
+// overflows: RMD1 = STP|OFLO|ERR, no ENP (TM p.1-26), RINT.
+func dOflo() *scen {
+	s := newDir("d_oflo", 2)
+	s.layout(am7990.ModeDTX, 0, 0, 0, []rxd{{true, 256}}, nil)
+	s.snapshot()
+	s.dstart()
+	s.op("G 1500")
+	f := frame(mac, 200, 0x31)
+	s.op("F %s", cable(f))
+	s.si()
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0RINT|am7990.CSR0RXON)
+	s.zword(rdra+2, am7990.RMD1ERR|am7990.RMD1OFLO|am7990.RMD1STP|hadrRx)
+	for i := 0; i < 16; i += 2 {
+		s.zword(uint32(rxbuf+i), uint16(f[i])<<8|uint16(f[i+1]))
+	}
+	s.op("E")
+	return s
+}
+
+// d_runt: a 63-byte frame is discarded and its buffer serves the next
+// frame (TM p.1-19).
+func dRunt() *scen {
+	s := newDir("d_runt", 2)
+	s.layout(am7990.ModeDTX, 0, 1, 0, []rxd{{true, 128}, {true, 128}}, nil)
+	s.snapshot()
+	s.dstart()
+	s.op("F %s", cable(frame(mac, 59, 0x51)))
+	g := frame(mac, 64, 0x61)
+	s.op("F %s", cable(g))
+	s.si()
+	s.op("T 2000")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0RINT|am7990.CSR0RXON)
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+6, 68)
+	s.zword(rdra+10, am7990.RMD1OWN|hadrRx)
+	for i := 0; i < 64; i += 2 {
+		s.zword(uint32(rxbuf+i), uint16(g[i])<<8|uint16(g[i+1]))
+	}
+	s.op("E")
+	return s
+}
+
+// d_coll: a frame from a peer arrives while the chip transmits: CLSN.
+// The chip ends the preamble and jams, backs off (first retry: r in
+// 0..1, the generator gives 1) and reloads (TM p.1-11).  The peer, gap
+// 90 bits, sends again during the backoff and is received: reception
+// has priority (TM p.1-16).  The backoff ends while it arrives, so the
+// retry defers: ONE|DEF (TM p.1-27).  Then our frame comes back.
+func dColl() *scen {
+	s := newDir("d_coll", 1)
+	f, g := frame(mac, 64, 0x71), frame(mac, 64, 0x81)
+	s.layout(0, 0, 1, 0, []rxd{{true, 128}, {true, 128}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("K 90")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.op("A")
+	s.op("J %s", cable(g))
+	s.si()
+	s.op("T 3000")
+	s.op("Q 2")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0TINT|am7990.CSR0RINT|am7990.CSR0RXON|am7990.CSR0TXON)
+	s.zword(tdra+2, am7990.TMD1ONE|am7990.TMD1DEF|am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+6, 68)
+	s.zword(rxbuf+20, uint16(g[20])<<8|uint16(g[21]))
+	s.zword(rdra+10, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rxbuf+0x100+20, uint16(f[20])<<8|uint16(f[21]))
+	s.txs = []string{cable(f)}
+	s.op("E")
+	return s
+}
+
+// d_gap: the chip loads a short frame in the gap after a carrier and
+// starts when the gap ends, regardless of the peer frame that began 6
+// bits earlier (TM p.1-17): a collision.  The peer frame, sent again
+// during the backoff, is received (TM p.1-16); the retry defers to it:
+// ONE|DEF.  Our 16-byte frame comes back a runt and is dropped.
+func dGap() *scen {
+	s := newDir("d_gap", 1)
+	f, g := frame(mac, 16, 0x75), frame(mac, 64, 0x85)
+	other := [6]byte{0x02, 0x60, 0x8C, 0x0C, 0x09, 0x02}
+	s.layout(0, 0, 1, 0, []rxd{{true, 128}, {true, 128}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("K 90")
+	s.op("F %s", cable(frame(other, 100, 0x95)))
+	s.op("B")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.op("F %s", cable(g))
+	s.si()
+	s.op("T 3000")
+	s.op("Q 2")
+	s.zword(tdra+2, am7990.TMD1ONE|am7990.TMD1DEF|am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+6, 68)
+	s.zword(rxbuf+20, uint16(g[20])<<8|uint16(g[21]))
+	s.zword(rdra+10, am7990.RMD1OWN|hadrRx)
+	s.txs = []string{cable(f)}
+	s.op("E")
+	return s
+}
+
+// d_rxcol: CLSN 800 bits into an arriving frame (another station
+// collides).  The reception ends at once: the 92 bytes so far, past
+// the runt limit, are written with a CRC error (TM p.1-11).  The peer
+// sends again and the frame lands whole in the next buffer.
+func dRxCol() *scen {
+	s := newDir("d_rxcol", 2)
+	g := frame(mac, 200, 0xA5)
+	s.layout(am7990.ModeDTX, 0, 1, 0, []rxd{{true, 256}, {true, 256}}, nil)
+	s.snapshot()
+	s.dstart()
+	s.op("Z 800")
+	s.op("F %s", cable(g))
+	s.si()
+	s.w(am7990.RegRDP, am7990.CSR0RINT|am7990.CSR0INEA)
+	s.si()
+	s.op("T 3000")
+	s.zword(rdra+2, am7990.RMD1ERR|am7990.RMD1CRC|am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+6, 92)
+	s.zword(rdra+10, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+14, 204)
+	s.zword(rxbuf+0x100+150, uint16(g[150])<<8|uint16(g[151]))
+	s.op("E")
+	return s
+}
+
+// d_late: CLSN from bit 700 of the transmission, 636 bits into the
+// frame, after the slot time: LCOL in TMD3, TMD1 ERR, no retry, TINT
+// (TM p.1-11, p.1-28).  The cut frame does not come back.
+func dLate() *scen {
+	s := newDir("d_late", 2)
+	f := frame(mac, 100, 0x13)
+	s.layout(0, 0, 0, 0, []rxd{{true, 256}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("U 700")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 3000")
+	s.op("Q 1")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0TINT|am7990.CSR0RXON|am7990.CSR0TXON)
+	s.zword(tdra+2, am7990.TMD1ERR|am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(tdra+6, am7990.TMD3LCOL)
+	s.zword(rdra+2, am7990.RMD1OWN|hadrRx)
+	s.op("E")
+	return s
+}
+
+// d_rtry: CLSN from bit 100 of every transmission.  16 attempts, then
+// RTRY in TMD3 and TMD1 ERR (MORE: 15 retries), TINT, the transmitter
+// stays on (TM p.1-11, p.1-28).
+func dRtry() *scen {
+	s := newDir("d_rtry", 2)
+	f := frame(mac, 64, 0x23)
+	s.layout(0, 0, 0, 0, []rxd{{true, 256}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("U 100")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 3000")
+	s.op("Q 16")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0TINT|am7990.CSR0RXON|am7990.CSR0TXON)
+	s.zword(tdra+2, am7990.TMD1ERR|am7990.TMD1MORE|am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(tdra+6, am7990.TMD3RTRY)
+	s.op("E")
+	return s
+}
+
+// d_drty: DRTY allows one attempt: the first collision gives RTRY
+// (TM p.1-24).
+func dDrty() *scen {
+	s := newDir("d_drty", 2)
+	f := frame(mac, 64, 0x33)
+	s.layout(am7990.ModeDRTY, 0, 0, 0, []rxd{{true, 256}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("U 100")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 3000")
+	s.op("Q 1")
+	s.zword(tdra+2, am7990.TMD1ERR|am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(tdra+6, am7990.TMD3RTRY)
+	s.op("E")
+	return s
+}
+
+// d_chain: DRTY and a collision on a chained frame (100 + 32 bytes):
+// RTRY goes to the first buffer, the rest of the frame is released
+// unsent (TM p.1-15, p.4-9).
+func dChain() *scen {
+	s := newDir("d_chain", 2)
+	f := frame(mac, 132, 0x63)
+	s.layout(am7990.ModeDRTY, 0, 0, 1, []rxd{{true, 256}},
+		[]txd{{true, true, false, f[:100]}, {true, false, true, f[100:]}})
+	s.snapshot()
+	s.dstart()
+	s.op("U 100")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 3000")
+	s.op("Q 1")
+	s.zword(tdra+2, am7990.TMD1ERR|am7990.TMD1STP|hadrTx)
+	s.zword(tdra+6, am7990.TMD3RTRY)
+	s.zword(tdra+10, am7990.TMD1ENP|hadrTx)
+	s.op("E")
+	return s
+}
+
+// d_lcar: the RENA echo drops at bit 200 while TENA is high: LCAR in
+// TMD3, TMD1 ERR; the whole frame is sent (TM p.1-28, p.4-9) and comes
+// back.
+func dLcar() *scen {
+	s := newDir("d_lcar", 1)
+	f := frame(mac, 64, 0x43)
+	s.layout(0, 0, 0, 0, []rxd{{true, 128}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("L 200")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 3000")
+	s.op("Q 1")
+	s.zword(tdra+2, am7990.TMD1ERR|am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(tdra+6, am7990.TMD3LCAR)
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rxbuf+20, uint16(f[20])<<8|uint16(f[21]))
+	s.txs = []string{cable(f)}
+	s.op("E")
+	return s
+}
+
+// d_cerr: no heartbeat within 2 us of the transmission: CERR and ERR in
+// CSR0, no interrupt of its own; writing 1 clears it (TM p.1-12,
+// p.1-20).
+func dCerr() *scen {
+	s := newDir("d_cerr", 1)
+	f := frame(mac, 64, 0x53)
+	s.layout(am7990.ModeDRX, 0, 0, 0, []rxd{{true, 128}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("H 0")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 100")
+	run := uint16(am7990.CSR0INEA | am7990.CSR0TXON | am7990.CSR0STRT)
+	s.expect(am7990.RegRDP, am7990.CSR0ERR|am7990.CSR0CERR|am7990.CSR0INTR|am7990.CSR0TINT|run)
+	s.w(am7990.RegRDP, am7990.CSR0CERR|am7990.CSR0TINT|am7990.CSR0INEA)
+	s.expect(am7990.RegRDP, run)
+	s.txs = []string{cable(f)}
+	s.op("E")
+	return s
+}
+
+// d_defer: TDMD while a frame for another station arrives.  The ring is
+// polled only once the line is inactive (TM p.1-15), so the frame is
+// loaded in the gap and sent without DEF.
+func dDefer() *scen {
+	s := newDir("d_defer", 1)
+	f := frame(mac, 64, 0x91)
+	other := [6]byte{0x02, 0x60, 0x8C, 0x0C, 0x09, 0x02}
+	s.layout(0, 0, 1, 0, []rxd{{true, 128}, {true, 128}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("F %s", cable(frame(other, 300, 0xA1)))
+	s.op("B")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 3000")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0TINT|am7990.CSR0RINT|am7990.CSR0RXON|am7990.CSR0TXON)
+	s.zword(tdra+2, am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+6, 68)
+	s.zword(rxbuf+40, uint16(f[40])<<8|uint16(f[41]))
+	s.txs = []string{cable(f)}
+	s.op("E")
+	return s
+}
+
+// d_def: a frame arrives while the first transmit burst waits for the
+// bus.  The chip defers (DEF, TM p.1-26) and sends after the gap; the
+// arriving frame, which finds transmit bytes in the silo, is not
+// received.  Our frame comes back into buffer 0.
+func dDef() *scen {
+	s := newDir("d_def", 1)
+	f := frame(mac, 64, 0xB1)
+	s.layout(0, 0, 1, 0, []rxd{{true, 128}, {true, 128}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.op("G 300")
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.op("C")
+	s.op("J %s", cable(frame(mac, 100, 0xC1)))
+	s.si()
+	s.op("T 3000")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0TINT|am7990.CSR0RINT|am7990.CSR0RXON|am7990.CSR0TXON)
+	s.zword(tdra+2, am7990.TMD1DEF|am7990.TMD1STP|am7990.TMD1ENP|hadrTx)
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+6, 68)
+	s.zword(rxbuf, uint16(f[0])<<8|uint16(f[1]))
+	s.zword(rxbuf+62, uint16(f[62])<<8|uint16(f[63]))
+	s.zword(rdra+10, am7990.RMD1OWN|hadrRx)
+	s.txs = []string{cable(f)}
+	s.op("E")
+	return s
+}
+
+// d_mask: a frame that starts 16 bit times after the chip's TENA falls.
+// RENA is masked for 4.1 us, the hunt starts 8 bits later, inside this
+// frame's preamble: it is received (TM p.1-19).  Then our frame comes
+// back.
+func dMask() *scen {
+	s := newDir("d_mask", 1)
+	f, g := frame(mac, 64, 0xD1), frame(mac, 64, 0xE1)
+	s.layout(0, 0, 1, 0, []rxd{{true, 128}, {true, 128}}, []txd{{true, true, true, f}})
+	s.snapshot()
+	s.dstart()
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.op("A")
+	s.op("T %d", 64+8*68+16)
+	s.op("J %s", cable(g))
+	s.si()
+	s.op("T 3000")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0TINT|am7990.CSR0RINT|am7990.CSR0RXON|am7990.CSR0TXON)
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+6, 68)
+	s.zword(rxbuf+20, uint16(g[20])<<8|uint16(g[21]))
+	s.zword(rdra+10, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rxbuf+0x100+20, uint16(f[20])<<8|uint16(f[21]))
+	s.txs = []string{cable(f)}
+	s.op("E")
+	return s
+}
+
+// d_rxmask: a frame that starts 2 us after a reception ends is not
+// received (TM p.1-19); the next one, after the gap, is.
+func dRxMask() *scen {
+	s := newDir("d_rxmask", 1)
+	a, b, c := frame(mac, 64, 0x15), frame(mac, 64, 0x25), frame(mac, 64, 0x35)
+	s.layout(am7990.ModeDTX, 0, 1, 0, []rxd{{true, 128}, {true, 128}}, nil)
+	s.snapshot()
+	s.dstart()
+	s.op("F %s", cable(a))
+	s.op("B")
+	s.op("T %d", 64+8*68+20)
+	s.op("J %s", cable(b))
+	s.op("F %s", cable(c))
+	s.si()
+	s.op("T 3000")
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+10, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rxbuf+20, uint16(a[20])<<8|uint16(a[21]))
+	s.zword(rxbuf+0x100+20, uint16(c[20])<<8|uint16(c[21]))
+	s.op("E")
+	return s
+}
+
+// d_buff: a chained frame whose second buffer is not the chip's.  The
+// first buffer is sent and the silo runs dry: TMD3 BUFF|UFLO and TMD1
+// ERR in the first buffer, the second untouched, TINT, TXON off
+// (TM p.1-15, p.1-28).  The cut frame comes back with a bad FCS.
+func dBuff() *scen {
+	s := newDir("d_buff", 2)
+	f := frame(mac, 132, 0x73)
+	s.layout(0, 0, 0, 1, []rxd{{true, 256}},
+		[]txd{{true, true, false, f[:100]}, {false, false, true, f[100:]}})
+	s.snapshot()
+	s.dstart()
+	s.w(am7990.RegRDP, am7990.CSR0INEA|am7990.CSR0TDMD)
+	s.si()
+	s.op("T 3000")
+	s.expect(am7990.RegRDP, csr0Int|am7990.CSR0TINT|am7990.CSR0RINT|am7990.CSR0RXON)
+	s.zword(tdra+2, am7990.TMD1ERR|am7990.TMD1STP|hadrTx)
+	s.zword(tdra+6, am7990.TMD3BUFF|am7990.TMD3UFLO)
+	s.zword(tdra+10, am7990.TMD1ENP|hadrTx)
+	s.zword(rdra+2, am7990.RMD1ERR|am7990.RMD1CRC|am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rxbuf+98, uint16(f[98])<<8|uint16(f[99]))
+	s.op("E")
+	return s
+}
+
+// d_rxmask2: a frame that starts 4.3 us after a reception ends is
+// received: the mask lasts 4.1 us (TM p.1-19).
+func dRxMask2() *scen {
+	s := newDir("d_rxmask2", 1)
+	a, b := frame(mac, 64, 0x16), frame(mac, 64, 0x26)
+	s.layout(am7990.ModeDTX, 0, 1, 0, []rxd{{true, 128}, {true, 128}}, nil)
+	s.snapshot()
+	s.dstart()
+	s.op("F %s", cable(a))
+	s.op("B")
+	s.op("T %d", 64+8*68+43)
+	s.op("J %s", cable(b))
+	s.si()
+	s.op("T 3000")
+	s.zword(rdra+2, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rdra+10, am7990.RMD1STP|am7990.RMD1ENP|hadrRx)
+	s.zword(rxbuf+20, uint16(a[20])<<8|uint16(a[21]))
+	s.zword(rxbuf+0x100+20, uint16(b[20])<<8|uint16(b[21]))
+	s.op("E")
+	return s
+}
+
+// ---- board glue: decode, PROM, vector ------------------------------------------
+
+func board(dir string) {
+	b := lanboard.New(nil)
+	var out strings.Builder
+	out.WriteString("# board decode: port st bw rw -> drive value (DS-fall sample)\n")
+	cyc := func(port uint16, st uint8, bw, read bool, d uint16) system.CardResponse {
+		in := system.CardBus{RESET_n: true, IEI: true, INTACK_n: true, CycleActive: true,
+			LatchedStatus: st, LatchedAddr: port, LatchedRW: read, LatchedBW: bw, DSFalling: true, AD: d}
+		return b.TickBus(in)
+	}
+	sts := []struct {
+		st uint8
+		c  int
+	}{{zbus.StatusIO, 2}, {zbus.StatusSpecialIO, 3}, {zbus.StatusDataMem, 8}}
+	ports := []uint16{0x0600, 0x06FE, 0x0700, 0x0702, 0x0704, 0x070E, 0x0710, 0x0711, 0x0712, 0x0714, 0x0716, 0x07FE, 0x0800, 0x1710, 0xF700}
+	// RAP holds 2 so a decoded RAP read is told apart from an RDP read
+	cyc(0x0702, zbus.StatusIO, false, false, 2)
+	for _, p := range ports {
+		for _, s := range sts {
+			for _, bw := range []bool{false, true} {
+				r := cyc(p, s.st, bw, true, 0)
+				dr, bwi := 0, 0
+				if r.ADDrive {
+					dr = 1
+				}
+				if bw {
+					bwi = 1
+				}
+				fmt.Fprintf(&out, "D %04X %X %d %d %04X\n", p, s.c, bwi, dr, r.AD&uint16(0xFFFF*dr))
+			}
+		}
+	}
+	fmt.Fprintf(&out, "V %02X\n", b.Vector())
+	if err := os.WriteFile(filepath.Join(dir, "board.vec"), []byte(out.String()), 0o644); err != nil {
+		panic(err)
+	}
+}
+
+func main() {
+	dir := os.Args[1]
+	for _, s := range []*scen{
+		scRegs(), scInit(),
+		scLoop("loop", 0, 64, false),
+		scLoop("loop_odd", 0, 75, false),
+		scLoop("bswp0", 0, 64, false),
+		scLoop("crc", am7990.ModeDTCR, 64, false),
+		scLoop("intl", am7990.ModeLOOP|am7990.ModeINTL, 32, true),
+		scLoop("intl_dtcr", am7990.ModeLOOP|am7990.ModeINTL|am7990.ModeDTCR, 32, true),
+		scRing(), scMiss(), scFilter(), scPoll(), scOdd(), scSkip(),
+		dUflo(), dOflo(), dRunt(), dColl(), dGap(), dRxCol(), dLate(), dRtry(), dDrty(), dChain(), dLcar(), dCerr(),
+		dDefer(), dDef(), dMask(), dRxMask(), dBuff(), dRxMask2(),
+	} {
+		s.write(dir)
+	}
+	board(dir)
+}
