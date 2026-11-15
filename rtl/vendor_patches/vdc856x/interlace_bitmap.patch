@@ -1,0 +1,55 @@
+--- a/vdc_signals_v.sv
++++ b/vdc_signals_v.sv
+@@ -128,10 +128,13 @@
+ 					newsrow <= 1;
+ 
+ 					frameFetched <= 0;
+-					if (~&reg_im || cfield || !reg_text)
++					// Interlaced bitmap: the screen start loads once a frame, for the
++					// even field (its VSYNC started with HSYNC); the odd field
++					// continues in RAM after it.
++					if (~&reg_im || vsLine || !reg_text)
+ 						fetchFrame <= ~frameFetched;
+ 
+-					fetchLine <= cfield & reg_text & |ctv;
++					fetchLine <= 0;
+ 				end
+ 			end
+ 			else begin
+@@ -162,7 +165,7 @@
+ 
+ 						if (crow<=vd)
+ 							fetchRow <= 1;
+-						else if (!frameFetched && (~&reg_im || ncfield || !reg_text)) begin
++						else if (!frameFetched && (~&reg_im || !reg_text)) begin
+ 							fetchFrame <= 1;
+ 							frameFetched <= 1;
+ 						end
+@@ -226,6 +229,7 @@
+ // vsync
+ 
+ reg [4:0] vsCount;
++reg       vsLine;
+ assign vsync = |vsCount;
+ 
+ always @(posedge clk) begin
+@@ -234,6 +238,7 @@
+ 
+ 	if (reset) begin
+ 		vsCount <= 0;
++		vsLine <= 0;
+ 	end
+ 	else if (enable) begin
+ 		if (newsrow && lineStart)
+@@ -245,8 +250,10 @@
+ 			if (srow == reg_vp-1 && nsline == ctv)
+ 				vsBegin <= 1;
+ 
+-			if (vsBegin)
++			if (vsBegin) begin
+ 				vsCount <= {~|reg_vw, reg_vw};
++				vsLine <= vSyncStart[0];
++			end
+ 			else if (|vsCount)
+ 				vsCount <= vsCount-1'd1;
+ 		end

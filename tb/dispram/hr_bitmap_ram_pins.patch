@@ -1,0 +1,84 @@
+--- a/hrdisp/hr_card.sv
++++ b/hrdisp/hr_card.sv
+@@ -52,7 +52,13 @@
+   output logic [3:0]  rgbi,
+   output logic [3:0]  u104,
+   output logic        mono_en,
+-  output logic        mono_i
++  output logic        mono_i,
++  // FN#4 bitmap block RAM (hr_fn4_dram)
++  output logic [13:0] m_wrow,
++  output logic [7:0]  m_we,
++  output logic [63:0] m_wd,
++  output logic [13:0] m_rrow,
++  input  logic [63:0] m_q
+ );
+   // FN#2 sync group
+   logic [3:0]  t;
+@@ -80,7 +86,8 @@
+   logic [15:0] mem_ad;
+   logic        mem_drive;
+   hr_fn3_xp fn3 (.clk, .xclk(mem[1]), .cntres(f[7]), .xp);
+-  hr_fn4_dram fn4 (.clk, .a_row(la[16:3]), .a_we(dwe), .a_wd(wd), .a_q, .b_row(xp), .b_q);
++  hr_fn4_dram fn4 (.clk, .a_row(la[16:3]), .a_we(dwe), .a_wd(wd), .a_q, .b_row(xp), .b_q,
++    .m_wrow, .m_we, .m_wd, .m_rrow, .m_q);
+   hr_fn5 fn5 (.clk, .cyc(mem[3]), .cdone(mem[2]), .we(arb[3]), .cas,
+     .lrw(brw), .re(re1 && re2), .la(la[2:1]), .ad_in, .row_q(a_q),
+     .dram_we(dwe), .dram_wd(wd), .ad_out(mem_ad), .ad_drive(mem_drive));
+--- a/hrdisp/hr_fn4_dram.sv
++++ b/hrdisp/hr_fn4_dram.sv
+@@ -9,6 +9,8 @@
+ // whole bus cycle) and at the fetch CAS (count 11, XP last changed at
+ // count 0), so neither the latency nor read-during-write shows; a
+ // program change that moves these must re-check it.
++// The block RAM sits outside the card (m_*): write row, byte strobes and
++// data, read row, and the row read at the last clk.
+ `default_nettype none
+ 
+ module hr_fn4_dram (
+@@ -18,30 +20,30 @@
+   input  logic [63:0] a_wd,
+   output logic [63:0] a_q,
+   input  logic [13:0] b_row,
+-  output logic [63:0] b_q
++  output logic [63:0] b_q,
++  output logic [13:0] m_wrow,
++  output logic [7:0]  m_we,
++  output logic [63:0] m_wd,
++  output logic [13:0] m_rrow,
++  input  logic [63:0] m_q
+ );
+-  // Justification: the bitmap DRAM, 128 KB (ram-a).
+-  (* ramstyle = "M10K, no_rw_check" *) logic [63:0] mem [16384];
+-  // Justification: read slot, the block-RAM read register and the two
+-  // output rows (reg-a).
++  // Justification: read slot and the two output rows (reg-a).
+   logic        sel, sel_q;
+-  logic [63:0] q, aq, bq;
++  logic [63:0] aq, bq;
+ 
+   initial begin
+-    mem = '{default: '0};
+     sel = 1'b0; sel_q = 1'b0;
+-    q = '0; aq = '0; bq = '0;
+-  end
+-  always_ff @(posedge clk) begin
+-    for (int b = 0; b < 8; b++)
+-      if (a_we[b]) mem[a_row][8*b +: 8] <= a_wd[8*b +: 8];
+-    q <= mem[sel ? b_row : a_row];
++    aq = '0; bq = '0;
+   end
++  assign m_wrow = a_row;
++  assign m_we   = a_we;
++  assign m_wd   = a_wd;
++  assign m_rrow = sel ? b_row : a_row;
+   always_ff @(posedge clk) begin
+     sel   <= ~sel;
+     sel_q <= sel;
+-    if (sel_q) bq <= q;
+-    else       aq <= q;
++    if (sel_q) bq <= m_q;
++    else       aq <= m_q;
+   end
+ 
+   assign a_q = aq;

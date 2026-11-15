@@ -1,0 +1,21 @@
+--- a/vdc_top.sv
++++ b/vdc_top.sv
+@@ -39,7 +39,9 @@
+ 	output                     mem_we,
+ 	output [RAM_ADDR_BITS-1:0] mem_addr,
+ 	output               [7:0] mem_di,
+-	input                [7:0] mem_do
++	input                [7:0] mem_do,
++
++	output                     status_busy  // status b7 inverted (Update Ready)
+ );
+ 
+ reg enable;
+@@ -136,6 +138,7 @@
+ wire	      hsync_pos;
+ 
+ wire        busy;
++assign      status_busy = busy;
+ wire  		hVisible, vVisible, hdispen;
+ 
+ assign      vsync = vsync_pos ^ (~version & reg_vspol);

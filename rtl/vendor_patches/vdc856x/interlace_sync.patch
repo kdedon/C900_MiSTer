@@ -1,0 +1,59 @@
+--- a/vdc_signals_v.sv
++++ b/vdc_signals_v.sv
+@@ -57,7 +57,7 @@
+ function [5:0] firstRowHeight;
+    input [4:0] ctv;
+ 
+-	if (cfield && (ctv[0]|reg_vt[0]) != reg_va[0])
++	if (&reg_im && cfield && (ctv[0]|reg_vt[0]) != reg_va[0])
+ 		return ctv + reg_va - 6'd1;
+ 	else
+ 		return ctv + reg_va;
+@@ -66,7 +66,7 @@
+ function [5:0] lastRowHeight;
+    input [4:0] ctv;
+ 
+-	if (cfield && (ctv[0]|reg_vt[0]) != reg_va[0])
++	if (&reg_im && cfield && (ctv[0]|reg_vt[0]) != reg_va[0])
+ 		return ctv - 6'd1;
+ 	else
+ 		return ctv;
+@@ -229,9 +229,14 @@
+ // vsync
+ 
+ reg [4:0] vsCount;
+-reg       vsLine;
++reg       vsLine, vsMid;
+ assign vsync = |vsCount;
+ 
++// Interlaced sync only: the odd field's VSYNC starts and counts on the
++// mid-line event, half a line later, its width in whole lines.
++wire vsMidSel = (|vsCount) ? vsMid : cfield;
++wire vsEvent  = &reg_im ? |vSyncStart : (reg_im[0] && vsMidSel) ? vSyncStart[1] : vSyncStart[0];
++
+ always @(posedge clk) begin
+ 	reg [4:0] ctv;
+ 	reg       vsBegin;
+@@ -239,12 +244,13 @@
+ 	if (reset) begin
+ 		vsCount <= 0;
+ 		vsLine <= 0;
++		vsMid <= 0;
+ 	end
+ 	else if (enable) begin
+ 		if (newsrow && lineStart)
+ 			ctv <= reg_ctv;
+ 
+-		if (vSyncStart[0] || (reg_im[0] && vSyncStart[1])) begin
++		if (vsEvent) begin
+ 			vsBegin <= 0;
+ 
+ 			if (srow == reg_vp-1 && nsline == ctv)
+@@ -253,6 +259,7 @@
+ 			if (vsBegin) begin
+ 				vsCount <= {~|reg_vw, reg_vw};
+ 				vsLine <= vSyncStart[0];
++				vsMid <= cfield;
+ 			end
+ 			else if (|vsCount)
+ 				vsCount <= vsCount-1'd1;

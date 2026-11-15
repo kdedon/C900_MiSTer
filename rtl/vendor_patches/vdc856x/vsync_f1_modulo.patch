@@ -1,0 +1,14 @@
+--- a/vdc_signals.sv
++++ b/vdc_signals.sv
+@@ -93,7 +93,10 @@
+ wire half1End     = endCol && col==(reg_ht/2)-1;
+ wire half2Start   = newCol && col==reg_ht/2;
+ wire hSyncStart   = endCol && col==hp;
+-wire vSyncStartF1 = endCol && col==(hp + (reg_ht>>1) - 1) % reg_ht;
++// (hp + ht/2 - 1) % ht in 9 bits: the sum is at most 381, and ht < 2 gives 0.
++wire [8:0] vsF1Sum    = 9'(hp) + 9'(reg_ht[7:1]) - 9'd1;
++wire [7:0] vsF1Col    = reg_ht < 8'd2 ? 8'd0 : 8'(vsF1Sum % 9'(reg_ht));
++wire vSyncStartF1 = endCol && col==vsF1Col;
+ wire lineEnd      = endCol && col==reg_ht;
+ 
+ reg  updateBlink;

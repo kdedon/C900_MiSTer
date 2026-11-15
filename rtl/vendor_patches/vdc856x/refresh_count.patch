@@ -1,0 +1,11 @@
+--- a/vdc_ramiface.sv
++++ b/vdc_ramiface.sv
+@@ -151,7 +151,7 @@
+ assign mem_addr = shuffleAddr(ram_addr, ram64k, reg_ram /*|| (ramAction==RA_IDLE || ramAction==RA_RFSH)*/);
+ assign mem_di   = ram_di;
+ 
+-wire en_rfsh = col >= reg_hd && col <= reg_hd+reg_drr;
++wire en_rfsh = col >= reg_hd && col < reg_hd+reg_drr;
+ wire en_int = col < 2 || col >= reg_ht-8'd2;
+ 
+ wire [7:0] attrlen = lastRow ? 8'd2 : reg_hd;

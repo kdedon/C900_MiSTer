@@ -1,0 +1,35 @@
+--- a/vdc_top.sv
++++ b/vdc_top.sv
+@@ -111,8 +111,8 @@
+ reg   [7:0] reg_deb;        // R34        7D 125     Display enable begin
+ reg   [7:0] reg_dee;        // R35        64 100     Display enable end
+ reg   [3:0] reg_drr;        // R36         5 5       Ram refresh/scan line
+-reg         reg_hspol = 0;  // R37[7]                [v2 only], HSYnc polarity
+-reg         reg_vspol = 0;  // R37[6]                [v2 only], VSYnc polarity
++reg         reg_hspol = 1;  // R37[7]                [v2 only], HSYnc polarity
++reg         reg_vspol = 1;  // R37[6]                [v2 only], VSYnc polarity
+ 
+ reg   [5:0] regSel;         // selected internal register (write to $D600)
+ 
+@@ -140,8 +140,8 @@
+ assign      status_busy = busy;
+ wire  		hVisible, vVisible, hdispen;
+ 
+-assign      vsync = vsync_pos ^ (~version & reg_vspol);
+-assign      hsync = hsync_pos ^ (~version & reg_hspol);
++assign      vsync = vsync_pos ^ (version & ~reg_vspol);
++assign      hsync = hsync_pos ^ (version & ~reg_hspol);
+ 
+ vdc_signals signals (
+ 	.clk(clk),
+@@ -351,8 +351,8 @@
+ 		reg_deb <= 0;
+ 		reg_dee <= 0;
+ 		reg_drr <= 0;
+-		reg_hspol <= 0;
+-		reg_vspol <= 0;
++		reg_hspol <= 1;
++		reg_vspol <= 1;
+ 
+ 		lp_n0 <= 0;
+ 	end

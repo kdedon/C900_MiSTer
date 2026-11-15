@@ -1,0 +1,80 @@
+--- a/vdc_ramiface.sv
++++ b/vdc_ramiface.sv
+@@ -62,7 +62,14 @@
+ 	output         rowbuf,                     // buffer containing current screen info
+ 	output   [7:0] attrbuf[2][S_LATCH_WIDTH],  // latch for attributes for current and next row
+ 	output   [7:0] charbuf[C_LATCH_WIDTH],     // character data for current col
+-	output  [15:0] dispaddr
++	output  [15:0] dispaddr,
++
++	// RAM pins, set at the start of a column and held to the next
++	output                     mem_rd,
++	output                     mem_we,
++	output [RAM_ADDR_BITS-1:0] mem_addr,
++	output               [7:0] mem_di,
++	input                [7:0] mem_do     // the byte read at the last mem_rd
+ );
+ 
+ reg [7:0] scrnbuf[2][S_LATCH_WIDTH];  // screen codes for current and next row
+@@ -77,7 +84,7 @@
+ reg        ram_we;
+ reg [15:0] ram_addr;
+ reg  [7:0] ram_di;
+-reg  [7:0] ram_do;
++wire [7:0] ram_do = mem_do;
+ 
+ function [RAM_ADDR_BITS-1:0] shuffleAddr;
+ 	input [15:0] addr;
+@@ -94,15 +101,10 @@
+ end
+ endfunction
+ 
+-vdcram #(8, RAM_ADDR_BITS) ram
+-(
+-	.clk(clk),
+-	.rd(ram_rd),
+-	.we(ram_we),
+-	.addr(shuffleAddr(ram_addr, ram64k, reg_ram /*|| (ramAction==RA_IDLE || ramAction==RA_RFSH)*/)),
+-	.dai(ram_di),
+-	.dao(ram_do)
+-);
++assign mem_rd   = ram_rd;
++assign mem_we   = ram_we;
++assign mem_addr = shuffleAddr(ram_addr, ram64k, reg_ram /*|| (ramAction==RA_IDLE || ramAction==RA_RFSH)*/);
++assign mem_di   = ram_di;
+ 
+ wire en_rfsh = col >= reg_hd && col <= reg_hd+reg_drr;
+ wire en_int = col < 2 || col >= reg_ht-8'd2;
+--- a/vdc_top.sv
++++ b/vdc_top.sv
+@@ -32,7 +32,14 @@
+ 	output reg     pixel_ce,
+ 	output reg     active_h,
+ 	output reg     active_v,
+-	output   [3:0] rgbi
++	output   [3:0] rgbi,
++
++	// RAM pins (vdc_ramiface)
++	output                     mem_rd,
++	output                     mem_we,
++	output [RAM_ADDR_BITS-1:0] mem_addr,
++	output               [7:0] mem_di,
++	input                [7:0] mem_do
+ );
+ 
+ reg enable;
+@@ -236,7 +243,13 @@
+ 	.rowbuf(rowbuf),
+ 	.attrbuf(attrbuf),
+ 	.charbuf(charbuf),
+-	.dispaddr(dispaddr)
++	.dispaddr(dispaddr),
++
++	.mem_rd(mem_rd),
++	.mem_we(mem_we),
++	.mem_addr(mem_addr),
++	.mem_di(mem_di),
++	.mem_do(mem_do)
+ 
+ );
+ 
