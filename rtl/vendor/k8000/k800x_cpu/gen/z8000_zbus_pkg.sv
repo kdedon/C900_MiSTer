@@ -1,0 +1,27 @@
+// z8000_zbus_pkg: the 16 Z-Bus ST3..ST0 status codes.
+// Constants package: UNUSEDPARAM waived for this file only.
+/* verilator lint_off UNUSEDPARAM */
+package z8000_zbus_pkg;
+
+  localparam logic [3:0] ST_INTERNAL_OP         = 4'b0000;
+  localparam logic [3:0] ST_REFRESH             = 4'b0001;
+  localparam logic [3:0] ST_IO                  = 4'b0010;
+  localparam logic [3:0] ST_SPECIAL_IO          = 4'b0011;
+  localparam logic [3:0] ST_SEGMENT_TRAP        = 4'b0100;
+  localparam logic [3:0] ST_NMI_ACK             = 4'b0101;
+  localparam logic [3:0] ST_NVI_ACK             = 4'b0110;
+  localparam logic [3:0] ST_VI_ACK              = 4'b0111;
+  localparam logic [3:0] ST_DATA_MEM            = 4'b1000;
+  localparam logic [3:0] ST_STACK_MEM           = 4'b1001;
+  localparam logic [3:0] ST_DATA_MEM_EPU        = 4'b1010;
+  localparam logic [3:0] ST_STACK_MEM_EPU       = 4'b1011;
+  localparam logic [3:0] ST_PROG_SPACE          = 4'b1100;
+  localparam logic [3:0] ST_INSTR_FETCH_FIRST   = 4'b1101;
+  localparam logic [3:0] ST_EPU_TRANSFER        = 4'b1110;
+  localparam logic [3:0] ST_BUS_LOCK_DATA       = 4'b1111;
+
+  // Helpers as expressions:
+  //   memory cycle : st[3]
+  //   fetch cycle  : st[3:1] == 3'b110   (1100 ProgSpace, 1101 IF1)
+
+endpackage

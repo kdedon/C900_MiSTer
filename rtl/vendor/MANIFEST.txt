@@ -1,0 +1,19 @@
+# Vendored RTL. Written by scripts/sync_vendor.sh; do not edit by hand.
+synced 2026-11-16T04:04:00Z
+T48 837bd24f8a93275e0233c679b4f00e344bb4e912 rtl/vhdl (github.com/devsaurus/t48) -> t48/
+  patched: vendor_patches/t48/t48_pins.patch md5 7235ba336df8e59dbe525ae8d874a9f4 (local)
+T65 2f30f68e61a232dafe70ce09c0adb7f10b059d12 rtl/t65 (github.com/MiSTer-devel/C64_MiSTer) -> t65/
+SDRAM 227d4f418fd908a66712329400a6f619ca4fee77 rtl/mem/sdram.sv (github.com/MiSTer-devel/NeoGeo_MiSTer) -> sdram/
+k8000 c12dda6aeeb5bdbe9877eb55898307c761581b77
+Template_MiSTer 76dd8f5c509a2237b8e707773032a31df5905048 sys/
+VDC856X f31162f99cea2dbbd9fdb2f4db2a91ffa6e9f9f3 rtl/vdc856x + rtl/rgbicolor.vhd (github.com/MiSTer-devel/C128_MiSTer, Erik Scheffers) -> vdc856x/
+  patched: vendor_patches/vdc856x/vsync_f1_modulo.patch md5 13626d54e3bce2d6732aa961c54d65ae (local: field-1 vsync modulo in 9 bits, no function change; tb/lc_display make eq)
+  patched: vendor_patches/vdc856x/ram_pins.patch md5 c4503664a888ce2d8723fe0e8f989d25 (local: the RAM block moves out of the chip to its pins, c900_dispram; vdcram.v unused)
+  patched: vendor_patches/vdc856x/busy_pin.patch md5 fc1a7bf75152b5a8802e9454eaa2ba43 (local: status b7 busy to a port, for the 8568 INTR pin in mos8568)
+  patched: vendor_patches/vdc856x/row_ram.patch md5 d3a80c9130162a633501c1afd0cbb6d1 (local: the row latches in block RAM, no function change; tb/lc_display make eq)
+  patched: vendor_patches/vdc856x/interlace_bitmap.patch md5 bdbd5de55b5042337a1927d28425cbc4 (local: interlaced bitmap loads R12/R13 once a frame, for the even field; the odd field continues after it; no fetch in the top adjust row)
+  patched: vendor_patches/vdc856x/interlace_sync.patch md5 99baec5a5525fffb161e0486e802ab99 (local: R8 01 VSYNC half a line later in alternate fields, width in whole lines; row heights as R8 00)
+  patched: vendor_patches/vdc856x/refresh_count.patch md5 cea69488462a1d2ba375c93df8051411 (local: R36 refresh cycles per line, not R36+1)
+  patched: vendor_patches/vdc856x/sync_polarity.patch md5 32f84f9898436134071cfe933f0a2ac0 (local: R37 b7/b6 set the 8568 HSYNC/VSYNC polarity, 1 = positive, 1 from reset)
+  licence: GPL-2, inferred from the author's other releases (CBM-II_MiSTer: GPL-2 LICENSE and GPL-2 file headers); no header in vdc856x, no LICENSE in C128_MiSTer; compatible with C900_MiSTer GPL-2
+  Verilator: tb/lc_display/vdc_sim.patch makes a simulation copy in obj_dir (never committed)
