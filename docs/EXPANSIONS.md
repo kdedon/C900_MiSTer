@@ -1,0 +1,28 @@
+# Expansions
+
+Options beyond the base machine. Stock options are faithful hardware not
+yet built. NON-STOCK options are labelled so in code and OSD, off by
+default, and leave the stock machine unchanged when off (DECISIONS.md
+D-OSD-3). Sources are theory/ files, DECISIONS rows and RTL; the
+private design notes behind a row are not part of this repository.
+
+| Option | Stock? | Sources | What it needs | Status |
+|---|---|---|---|---|
+| 512K / 1M DRAM | stock | theory/chips/U54_FPLA.md; theory/SYSTEM.md sec. 4 | U54 ROM + `c900_dram` | OSD bit 4 (Motherboard RAM); built |
+| RAM card 2M / 4M / 8M / 15M | NON-STOCK | theory/SYSTEM.md sec. 11; DECISIONS D-MEM-8, O-11, O-12 | `c900_ramcard`: fixed base 0x18, fills segments upward less 0x37, 0x3E-0x3F, 0xFF: 2M 0x18-0x36 (31 segments); 4M to 0x5A; 8M to 0x9A; 15M to 0xFE (228 segments, 14.25 MB: the space ends). With 512K, 0x10-0x17 stays empty and the stock BIOS stops there. Stock BIOS with 1M: 2M gives 2976K on every display (LR + 2M safe); 4M-15M give 3008K headless or HR, and with the LR card pass the CDR (0x37) into the kernel pool (unsafe: they need the new BIOS with LR); patched BIOS and kernel to use all of it (separate task) | OSD P1O[22:20] RAM card; built (tb/expansion, gate step 19) |
+| 10 / 12 / 48 MHz CPU | NON-STOCK (10 MHz = the Z8001B grade, never on a C900; 12 MHz = an overclocked Z8000; 48 MHz = no Z8000 grade) | theory/SYSTEM.md sec. 2 (speed grades, sources); DECISIONS clock table, D-CLK-6, 9, 12, 13, 14 | `c900_turbo`: CPU clock enable beside the faithful clock tree, stretched to stock timing for every stock-rate device (DECISIONS clock table); CPU closes 48 MHz | OSD bits 7:6 (README, CPU clock); built, on the MiSTer at 6 and 48 MHz with every card (2026-11-16) |
+| LR / HR display card | stock | theory/chips/LR_CARD_LOGIC.md, HR_CARD_LOGIC.md | the cards | OSD bits 12:11 (LR, HR, none); built |
+| HR 1024x1024 mono, 640x400 RGBI | stock jumper (FN#2 JP3) | theory/chips/HR_CARD_LOGIC.md; theory/SYSTEM.md sec. 2 | HR card; timings derived, not measured; Coherent drives mono only | OSD bits 3:2 (HR); built |
+| HR mouse (FN#7) | stock on HR | theory/chips/HR_CARD_LOGIC.md (U755-U757); theory/SYSTEM.md sec. 5 | U754-U757 (vendored hr_fn7); `ps2_mouse_quad`: PS/2 to J2 quadrature, 10 kHz per axis | built (tb/mouse) |
+| LANCE Ethernet | NON-STOCK | theory/LANCE_CARD.md | Am7990, Z-Bus master, I/O 0x0700/0x0702, PROM 0x0710-0x0714, last in chain, vector 0x88, boot ROM window 0x0718/0x071A; no Coherent driver yet (ROADMAP) | OSD P1O[19:17] Network interface; built |
+| Z8070 FPU | NON-STOCK (socket existence OPEN O-10) | theory/SYSTEM.md sec. 11; DECISIONS D-BUS-14 | EPU on AD/ST/strobes, BUSY -> /STOP; k8000 CPU already emits ST 1010/1110 and traps without EPA; Coherent has no FPU support | OSD bit 9; built (DECISIONS D-BUS-14, gate step 11); socket existence on real boards OPEN O-10 |
+| 64 KB boot ROM | stock-capable (two 27256 fit; U54 decodes all of segment 0) | theory/SYSTEM.md sec. 4; DECISIONS D-ROM-5 | a 64 KB `boot0.rom` as a 27256 pair | built (D-ROM-5; gate step 17) |
+| Extra serial ports (LR U36 SCC) | stock socket, empty on the inventoried board; modelled fitted | theory/chips/LR_CARD_LOGIC.md; DECISIONS D-SER-4 | second z8030_scc on the LR card at 0x0380-0x03FF, chained after U31; al.c drives 6 lines | always fitted, runs with the LR card selected (DECISIONS D-SER-4); the lines connect to nothing; built (tb/lr_display scc) |
+| RTC set from MiSTer | NON-STOCK convenience (the real chip is battery backed) | DECISIONS D-RTC-2 | load hps_io RTC into the MSM58321 counters at reset | `rtc_seed`; built |
+| Hard disk sizes | stock table | theory/FLOWS.md sec. 4; DECISIONS D-IMG-6 | boot ROM `dparam[]` 10/10/20/42.9 MB; at most 2047 x 8 x 17 = 278,392 blocks (about 142.5 MB) per drive: the WD2010's 11-bit cylinder register, the 136-block cylinder buffer; above 42.9 MB only as a fixed VHD | follows the image; a VHD past the limit is no drive (D-IMG-6) |
+| Second hard disk | stock (DRIVE 1 on the controller) | kernel drv/wd.c; DECISIONS D-IMG-5 | hps_io VDNUM 4, OSD "Hard Disk 1"; drive 1 on the WD1003 card and its own disk_stream unit | built (ecee1c0); tested on the MiSTer 2026-11-15: Coherent 0.7.2 raw read/write of drive 1 (minor 0x10), data in the image file, persists across reload |
+| Centronics | stock | SP 10, 11; theory/SYSTEM.md sec. 10 | U70 PB data + PC0 BUSY, U66 PB1 /ACK + PC3 strobe through the 7407s; CN5 has nothing attached (/ACK, BUSY pulled High); no printer in the OSD (D-PRN-1); `centronics_printer` (MX-80 class) is a bench model only | port built; core bench prints the lp driver sequence through the model |
+| IEEE-488 | stock wiring (CIO U66, REN latch) | SP 10; theory/SYSTEM.md sec. 10 | U67 SN75160 + U68 SN75161 (`sn75160`, `sn75161`) to a CN4 wired-AND bus in `c900_core`; no Coherent driver. Endpoint not chosen: PET/CBM-II `ieee_drive` (GPLv2, needs drive ROMs and M10K) or USER_IO | bus + transceivers built, nothing attached |
+| Speaker | stock | SP 10; theory/SYSTEM.md sec. 10 | U66 PB0 (C/T 2 with EOE) -> U69 7407s -> CN3; `speaker_audio` level through a ~15 kHz one-pole low-pass on AUDIO_L/R. Coherent never sounds it | built; RTL core bench measures 440 Hz for TC 426 |
+| Second HD controller / tape | spec only | SHS | | not planned |
+| LC colour character card (8568) | NON-STOCK (SHS reserved 0x0180 for it; no board existed) | theory/SYSTEM.md sec. 11; DECISIONS D-OSD-4, D-BUS-13/15, D-VID-5, D-MEM-8 | `rtl/lc_display`: 8568 at 0x0181/0x0183, ID 0xC1 at 0x01FF, 64 KB shared display RAM, INTR on _NVI | OSD Display = 3; built |
