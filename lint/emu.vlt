@@ -1,0 +1,16 @@
+`verilator_config
+// The MiSTer framework is linted upstream.
+lint_off -file "sys/*"
+lint_off -rule PROCASSWIRE -file "sys/*"
+lint_off -file "obj_dir/lint/*"
+lint_off -file "*/obj_dir/ghdl/*"
+lint_off -file "obj_dir/ghdl/*"
+lint_off -rule DECLFILENAME -file "lint/emu_stubs.sv"
+// The template shell: module emu in C900.sv, hps_io ports left open.
+lint_off -rule DECLFILENAME -file "C900.sv"
+lint_off -rule PINMISSING -file "C900.sv"
+lint_off -rule PINCONNECTEMPTY -file "C900.sv"
+// Initialised locals in always blocks, the template's style.
+lint_off -rule BLKANDNBLK -file "sys/*"
+lint_off -rule BLKANDNBLK -file "C900.sv"
+lint_off -rule UNOPTFLAT -file "sys/*"

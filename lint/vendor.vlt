@@ -1,0 +1,29 @@
+`verilator_config
+// Vendored RTL is linted in its own repos.
+lint_off -file "rtl/vendor/*"
+// GHDL netlists of the vendored VHDL cores.
+lint_off -file "*/obj_dir/ghdl/*"
+lint_off -file "obj_dir/ghdl/*"
+// Simulation copy of the vendored SDRAM controller.
+lint_off -file "*/obj_dir/sdram/*"
+lint_off -file "obj_dir/sdram/*"
+// Simulation copy of the vendored 8563 and its RAM model.
+lint_off -file "*/obj_dir/vdc/*"
+lint_off -file "obj_dir/vdc/*"
+lint_off -file "*/tb/lc_display/vdcram_sim.v"
+lint_off -file "tb/lc_display/vdcram_sim.v"
+// The vendored 8563 assigns its wire ports procedurally (Quartus accepts it).
+lint_off -rule PROCASSWIRE -file "rtl/vendor/vdc856x/*"
+lint_off -rule PROCASSWIRE -file "*/rtl/vendor/vdc856x/*"
+lint_off -rule PROCASSWIRE -file "obj_dir/vdc/*"
+lint_off -rule PROCASSWIRE -file "*/obj_dir/vdc/*"
+// Chips moved from the vendored C900 RTL keep their module names and the
+// async resets they were waived for.
+lint_off -rule DECLFILENAME -file "rtl/lr_display/mc6845/mc6845_synth.v"
+lint_off -rule DECLFILENAME -file "rtl/hdc/t48_wdc.sv"
+lint_off -rule SYNCASYNCNET -file "rtl/c900_core.sv"
+lint_off -rule SYNCASYNCNET -file "rtl/hdc/drive_st506.sv"
+lint_off -rule DECLFILENAME -file "rtl/fdc/fd_pkg.sv"
+lint_off -rule UNUSEDPARAM -file "rtl/fdc/fd_pkg.sv"
+lint_off -rule DECLFILENAME -file "rtl/hdc/st506_pkg.sv"
+lint_off -rule UNUSEDPARAM -file "rtl/hdc/st506_pkg.sv"
